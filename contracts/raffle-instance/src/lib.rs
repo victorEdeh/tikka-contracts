@@ -22,6 +22,7 @@ use crate::events::{
     RaffleFinalized, RaffleStatusChanged, RandomnessReceived,
     RandomnessRequested, TicketPurchased,
     WinnerDrawn, RandomnessFallbackTriggered,
+    ContractPaused, ContractUnpaused,
 };
 
 const ORACLE_TIMEOUT_LEDGERS: u32 = 200;
@@ -294,6 +295,7 @@ impl Contract {
     }
 
     pub fn deposit_prize(env: Env) -> Result<(), Error> {
+        require_not_paused(&env)?;
         let mut raffle = read_raffle(&env)?;
         raffle.creator.require_auth();
 
@@ -353,6 +355,11 @@ impl Contract {
             .checked_mul(quantity as i128)
             .ok_or(Error::InvalidParameters)?;
 
+        let protocol_fee = total_price
+            .checked_mul(raffle.protocol_fee_bp as i128)
+            .ok_or(Error::ArithmeticOverflow)? / 10000;
+        let net_amount = total_price - protocol_fee;
+
         for _ in 0..quantity {
             let ticket_id = next_ticket_id(&env);
             raffle.tickets_sold += 1;
@@ -398,12 +405,19 @@ impl Contract {
             .try_transfer(&buyer, &env.current_contract_address(), &total_price)
             .map_err(|_| Error::TokenTransferFailed)?;
 
+        if protocol_fee > 0 {
+            if let Some(treasury) = &raffle.treasury_address {
+                token_client.transfer(&env.current_contract_address(), treasury, &protocol_fee);
+            }
+        }
+
         TicketPurchased {
             buyer,
             ticket_ids,
             quantity,
             ticket_price: raffle.ticket_price,
             total_paid: total_price,
+            protocol_fee,
             timestamp,
         }.publish(&env);
 
@@ -413,7 +427,6 @@ impl Contract {
     pub fn finalize_raffle(env: Env) -> Result<(), Error> {
         let mut raffle = read_raffle(&env)?;
         raffle.creator.require_auth();
-        require_not_paused(&env)?;
 
         if raffle.status != RaffleStatus::Active && raffle.status != RaffleStatus::Drawing {
             return Err(Error::InvalidStatus);
@@ -535,7 +548,6 @@ impl Contract {
 
     pub fn claim_prize(env: Env, winner: Address, tier_index: u32) -> Result<i128, Error> {
         winner.require_auth();
-        require_not_paused(&env)?;
         acquire_guard(&env)?;
         let mut raffle = read_raffle(&env)?;
 
@@ -728,17 +740,36 @@ impl Contract {
     }
 
     pub fn pause(env: Env) -> Result<(), Error> {
-        let admin: Address = env.storage().instance().get(&DataKey::Admin).ok_or(Error::NotAuthorized)?;
-        admin.require_auth();
+        let factory: Address = env.storage().instance().get(&DataKey::Factory).ok_or(Error::NotAuthorized)?;
+        factory.require_auth();
         env.storage().instance().set(&DataKey::Paused, &true);
+
+        ContractPaused {
+            paused_by: factory,
+            timestamp: env.ledger().timestamp(),
+        }.publish(&env);
+
         Ok(())
     }
 
     pub fn unpause(env: Env) -> Result<(), Error> {
-        let admin: Address = env.storage().instance().get(&DataKey::Admin).ok_or(Error::NotAuthorized)?;
-        admin.require_auth();
+        let factory: Address = env.storage().instance().get(&DataKey::Factory).ok_or(Error::NotAuthorized)?;
+        factory.require_auth();
         env.storage().instance().set(&DataKey::Paused, &false);
+
+        ContractUnpaused {
+            unpaused_by: factory,
+            timestamp: env.ledger().timestamp(),
+        }.publish(&env);
+
         Ok(())
+    }
+
+    pub fn is_paused(env: Env) -> bool {
+        env.storage()
+            .instance()
+            .get(&DataKey::Paused)
+            .unwrap_or(false)
     }
 
     pub fn set_admin(env: Env, new_admin: Address) -> Result<(), Error> {
