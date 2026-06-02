@@ -868,6 +868,7 @@ fn do_finalize_with_seed(
     write_raffle(env, &raffle);
 
     RaffleFinalized {
+        raffle_id: env.current_contract_address(),
         winners,
         winning_ticket_ids,
         total_tickets_sold: raffle.tickets_sold,
