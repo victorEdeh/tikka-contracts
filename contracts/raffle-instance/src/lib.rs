@@ -30,6 +30,8 @@ pub const MAX_DESCRIPTION_LENGTH: u32 = 1000;
 pub const MAX_TICKETS_LIMIT: u32 = 100_000;
 pub const MIN_TICKET_PRICE: i128 = 10_000;
 
+const EXPECTED_NETWORK_PASSPHRASE: [u8; 33] = *b"Test SDF Network ; September 2015";
+
 #[contract]
 pub struct Contract;
 
@@ -118,6 +120,16 @@ pub enum Error {
     NotInitialized = 43,
     Reentrancy = 44,
     TokenTransferFailed = 45,
+    InvalidNetwork = 46,
+}
+
+fn require_network_passphrase(env: &Env) -> Result<(), Error> {
+    let expected = Bytes::from_array(&env, &EXPECTED_NETWORK_PASSPHRASE);
+    let actual = env.ledger().network_passphrase();
+    if actual != expected {
+        return Err(Error::InvalidNetwork);
+    }
+    Ok(())
 }
 
 fn read_raffle(env: &Env) -> Result<Raffle, Error> {
@@ -210,6 +222,8 @@ impl Contract {
         if env.storage().instance().has(&DataKey::Raffle) {
             return Err(Error::AlreadyInitialized);
         }
+
+        require_network_passphrase(&env)?;
 
         if config.description.len() > MAX_DESCRIPTION_LENGTH {
             return Err(Error::InvalidParameters);
@@ -842,4 +856,17 @@ fn do_finalize_with_seed(
     }.publish(&env);
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use soroban_sdk::Env;
+
+    #[test]
+    fn init_should_require_expected_network_passphrase() {
+        let env = Env::default();
+        let expected = Bytes::from_array(&env, &EXPECTED_NETWORK_PASSPHRASE);
+        assert_eq!(env.ledger().network_passphrase(), expected);
+    }
 }
