@@ -130,6 +130,7 @@ pub enum Error {
     Reentrancy = 44,
     TokenTransferFailed = 45,
     MorePrizesThanTickets = 46,
+    InvalidTokenAddress = 47,
 }
 
 fn read_raffle(env: &Env) -> Result<Raffle, Error> {
@@ -191,6 +192,17 @@ fn require_not_paused(env: &Env) -> Result<(), Error> {
     {
         return Err(Error::ContractPaused);
     }
+    Ok(())
+}
+
+fn validate_token_address(env: &Env, token_address: &Address) -> Result<(), Error> {
+    // Try to call the token interface to verify it's a valid token contract
+    let token_client = token::Client::new(env, token_address);
+    // Try to get decimals - if this fails, it's not a valid token
+    token_client
+        .try_decimals()
+        .map_err(|_| Error::InvalidTokenAddress)?;
+    
     Ok(())
 }
 
@@ -295,6 +307,9 @@ impl Contract {
         if config.metadata_hash == BytesN::from_array(&env, &[0u8; 32]) {
             return Err(Error::InvalidParameters);
         }
+
+        // Validate that the payment_token is a valid token contract
+        validate_token_address(&env, &config.payment_token)?;
 
         // #259: claim_lockup_seconds must be within [0, MAX_CLAIM_LOCKUP_SECONDS].
         // Zero is interpreted as "use the default".
@@ -980,4 +995,57 @@ fn do_finalize_with_seed(
     }.publish(&env);
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use soroban_sdk::testutils::{Address as _, Ledger};
+
+    #[test]
+    fn test_validate_token_address_with_invalid_contract() {
+        let env = Env::default();
+        let invalid_address = Address::generate(&env);
+        
+        // Register a non-token contract
+        let contract_id = env.register(Contract, ());
+        
+        let result = validate_token_address(&env, &contract_id);
+        assert_eq!(result, Err(Error::InvalidTokenAddress));
+    }
+
+    #[test]
+    fn test_init_with_invalid_token_address() {
+        let env = Env::default();
+        let factory = Address::generate(&env);
+        let admin = Address::generate(&env);
+        let creator = Address::generate(&env);
+        let invalid_token = Address::generate(&env);
+        
+        let config = RaffleConfig {
+            description: String::from_str(&env, "Test raffle"),
+            end_time: 0,
+            max_tickets: 100,
+            min_tickets: 1,
+            allow_multiple: true,
+            ticket_price: 100,
+            payment_token: invalid_token,
+            prize_amount: 1000,
+            prizes: Vec::from_array(&env, [10000]),
+            randomness_source: RandomnessSource::Internal,
+            oracle_address: None,
+            protocol_fee_bp: 0,
+            treasury_address: None,
+            swap_router: None,
+            tikka_token: None,
+            metadata_hash: BytesN::from_array(&env, &[1u8; 32]),
+            claim_lockup_seconds: 0,
+        };
+        
+        let contract_id = env.register(Contract, ());
+        let client = crate::ContractClient::new(&env, &contract_id);
+        
+        let result = client.init(&factory, &admin, &creator, &config);
+        assert_eq!(result, Err(Error::InvalidTokenAddress));
+    }
 }
