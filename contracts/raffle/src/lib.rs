@@ -106,6 +106,16 @@ fn require_factory_not_paused(env: &Env) -> Result<(), ContractError> {
     Ok(())
 }
 
+fn is_zero_address(env: &Env, address: &Address) -> bool {
+    let xdr = address.clone().to_xdr(env);
+    for b in xdr.iter() {
+        if b != 0 {
+            return false;
+        }
+    }
+    true
+}
+
 fn maybe_create_checkpoint(env: &Env, raffle_count: u32) {
     if raffle_count == 0 || raffle_count % CHECKPOINT_INTERVAL != 0 {
         return;
@@ -522,6 +532,16 @@ impl RaffleFactory {
     pub fn transfer_factory_admin(env: Env, new_admin: Address) -> Result<(), ContractError> {
         let admin = require_admin(&env)?;
 
+        if is_zero_address(&env, &new_admin) {
+            events::AdminTransferFailed {
+                current_admin: admin,
+                proposed_admin: new_admin,
+                reason_code: ContractError::InvalidParameters as u32,
+                timestamp: env.ledger().timestamp(),
+            }.publish(&env);
+            return Err(ContractError::InvalidParameters);
+        }
+
         if new_admin == admin {
             env.storage().persistent().remove(&DataKey::PendingAdmin);
             return Ok(());
@@ -550,6 +570,18 @@ impl RaffleFactory {
             .persistent()
             .get(&DataKey::PendingAdmin)
             .ok_or(ContractError::NoPendingTransfer)?;
+
+        if is_zero_address(&env, &pending) {
+            let current_admin: Address = env.storage().persistent().get(&DataKey::Admin).unwrap();
+            events::AdminTransferFailed {
+                current_admin,
+                proposed_admin: pending,
+                reason_code: ContractError::InvalidParameters as u32,
+                timestamp: env.ledger().timestamp(),
+            }.publish(&env);
+            return Err(ContractError::InvalidParameters);
+        }
+
         pending.require_auth();
 
         let old_admin: Address = env.storage().persistent().get(&DataKey::Admin).unwrap();
