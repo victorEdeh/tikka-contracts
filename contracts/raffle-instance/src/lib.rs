@@ -37,6 +37,7 @@ pub const MAX_CLAIM_LOCKUP_SECONDS: u64 = 604_800; // 7 days
 #[contract]
 pub struct Contract;
 
+#[soroban_sdk::contracttype]
 #[derive(Clone)]
 pub struct Raffle {
     pub creator: Address,
@@ -66,6 +67,7 @@ pub struct Raffle {
     pub claim_lockup_seconds: u64,
 }
 
+#[soroban_sdk::contracttype]
 #[derive(Clone)]
 pub struct FairnessMetadata {
     pub seed: u64,
@@ -608,9 +610,9 @@ impl Contract {
         Ok(env.current_contract_address())
     }
 
-    pub fn trigger_randomness_fallback(env: Env, caller: Address) -> Result<(), Error> {
+    pub fn trigger_randomness_fallback(env: Env, caller: Address, do_refund: bool) -> Result<(), Error> {
         caller.require_auth();
-        let raffle = read_raffle(&env)?;
+        let mut raffle = read_raffle(&env)?;
 
         let admin: Address = env.storage().instance().get(&DataKey::Admin).ok_or(Error::NotAuthorized)?;
         if caller != raffle.creator && caller != admin {
@@ -629,6 +631,20 @@ impl Contract {
         let request_ledger: u32 = env.storage().instance().get(&DataKey::RandomnessRequestLedger).unwrap_or(0);
         if env.ledger().sequence() < request_ledger + ORACLE_TIMEOUT_LEDGERS {
             return Err(Error::FallbackTooEarly);
+        }
+
+        if do_refund {
+            raffle.status = RaffleStatus::Cancelled;
+            write_raffle(&env, &raffle);
+
+            RaffleCancelled {
+                creator: raffle.creator.clone(),
+                reason: CancelReason::OracleTimeout,
+                tickets_sold: raffle.tickets_sold,
+                prize_refunded: raffle.prize_deposited,
+                timestamp: env.ledger().timestamp(),
+            }.publish(&env);
+            return Ok(());
         }
 
         let seed = build_internal_seed_u64(&env);
