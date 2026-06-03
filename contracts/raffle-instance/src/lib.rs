@@ -41,6 +41,8 @@ pub const EMERGENCY_WITHDRAW_DELAY_SECONDS: u64 = 90 * 24 * 3600; // 7776000
 const RAFFLE_TTL_BUMP: u32 = 432_000;
 const RAFFLE_TTL_THRESHOLD: u32 = 100_800;
 
+const EXPECTED_NETWORK_PASSPHRASE: [u8; 33] = *b"Test SDF Network ; September 2015";
+
 #[contract]
 pub struct Contract;
 #[contracttype]
@@ -294,6 +296,8 @@ impl Contract {
         if env.storage().persistent().has(&DataKey::Raffle) {
             return Err(Error::AlreadyInitialized);
         }
+
+        require_network_passphrase(&env)?;
 
         if config.description.len() > MAX_DESCRIPTION_LENGTH {
             return Err(Error::InvalidParameters);
