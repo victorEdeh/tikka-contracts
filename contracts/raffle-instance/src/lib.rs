@@ -43,6 +43,20 @@ const RAFFLE_TTL_THRESHOLD: u32 = 100_800;
 
 const EXPECTED_NETWORK_PASSPHRASE: [u8; 33] = *b"Test SDF Network ; September 2015";
 
+/// Minimum remaining ledgers before the instance TTL is considered "too close to expiry".
+/// If the TTL is below this threshold, extend_ttl will bump it up to INSTANCE_TTL_EXTEND_TO.
+pub const INSTANCE_TTL_THRESHOLD: u32 = 100_800; // ~7 days at 6s/ledger
+/// Target TTL (in ledgers) to extend the instance to on every state-changing call.
+pub const INSTANCE_TTL_EXTEND_TO: u32 = 518_400; // ~360 days at 6s/ledger
+
+/// Extends the contract instance TTL at the start of every state-changing entry point to
+/// prevent the instance from expiring mid-operation (issue #240).
+fn bump_instance_ttl(env: &Env) {
+    env.storage()
+        .instance()
+        .extend_ttl(INSTANCE_TTL_THRESHOLD, INSTANCE_TTL_EXTEND_TO);
+}
+
 #[contract]
 pub struct Contract;
 #[contracttype]
@@ -429,6 +443,7 @@ impl Contract {
     }
 
     pub fn deposit_prize(env: Env) -> Result<(), Error> {
+        bump_instance_ttl(&env);
         require_not_paused(&env)?;
         let mut raffle = read_raffle(&env)?;
         raffle.creator.require_auth();
@@ -631,6 +646,7 @@ impl Contract {
     }
 
     pub fn finalize_raffle(env: Env) -> Result<(), Error> {
+        bump_instance_ttl(&env);
         let mut raffle = read_raffle(&env)?;
         raffle.creator.require_auth();
 
@@ -849,6 +865,7 @@ impl Contract {
     }
 
     pub fn claim_prize(env: Env, winner: Address, tier_index: u32) -> Result<i128, Error> {
+        bump_instance_ttl(&env);
         winner.require_auth();
         let _guard = Guard::new(&env)?;
         let mut raffle = read_raffle(&env)?;
@@ -972,6 +989,7 @@ impl Contract {
     }
 
     pub fn cancel_raffle(env: Env, reason: CancelReason) -> Result<(), Error> {
+        bump_instance_ttl(&env);
         let mut raffle = read_raffle(&env)?;
 
         match reason {
@@ -1009,6 +1027,7 @@ impl Contract {
     }
 
     pub fn refund_prize(env: Env) -> Result<(), Error> {
+        bump_instance_ttl(&env);
         let mut raffle = read_raffle(&env)?;
         raffle.creator.require_auth();
 
@@ -1097,6 +1116,7 @@ impl Contract {
     }
 
     pub fn refund_ticket(env: Env, ticket_id: u32) -> Result<i128, Error> {
+        bump_instance_ttl(&env);
         acquire_guard(&env)?;
         let raffle = read_raffle(&env)?;
 
