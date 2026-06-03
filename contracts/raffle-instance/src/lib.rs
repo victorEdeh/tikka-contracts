@@ -43,6 +43,7 @@ pub struct Raffle {
     pub end_time: u64,
     pub no_deadline: bool,
     pub max_tickets: u32,
+    pub max_tickets_per_wallet: Option<u32>,
     pub min_tickets: u32,
     pub allow_multiple: bool,
     pub ticket_price: i128,
@@ -124,6 +125,7 @@ pub enum Error {
     NoActiveTickets = 46,
     TicketNotFound = 34,
     RaffleEnded = 35,
+    WalletTicketLimitExceeded = 36,
     ArithmeticOverflow = 41,
     AlreadyInitialized = 42,
     NotInitialized = 43,
@@ -159,6 +161,19 @@ fn get_ticket_owner(env: &Env, ticket_id: u32) -> Option<Address> {
         .persistent()
         .get::<_, Ticket>(&DataKey::Ticket(ticket_id))
         .map(|t| t.owner)
+}
+
+fn read_buyer_ticket_count(env: &Env, buyer: &Address) -> u32 {
+    env.storage()
+        .persistent()
+        .get(&DataKey::TicketCount(buyer.clone()))
+        .unwrap_or(0u32)
+}
+
+fn write_buyer_ticket_count(env: &Env, buyer: &Address, count: u32) {
+    env.storage()
+        .persistent()
+        .set(&DataKey::TicketCount(buyer.clone()), &count);
 }
 
 fn next_ticket_id(env: &Env) -> u32 {
@@ -308,6 +323,9 @@ impl Contract {
         if config.max_tickets == 0 || config.max_tickets > MAX_TICKETS_LIMIT {
             return Err(Error::InvalidParameters);
         }
+        if matches!(config.max_tickets_per_wallet, Some(0)) {
+            return Err(Error::InvalidParameters);
+        }
         if config.max_tickets < config.min_tickets {
             return Err(Error::InvalidTicketRange);
         }
@@ -369,6 +387,7 @@ impl Contract {
             end_time: config.end_time,
             no_deadline: config.no_deadline,
             max_tickets: config.max_tickets,
+            max_tickets_per_wallet: config.max_tickets_per_wallet,
             min_tickets: config.min_tickets,
             allow_multiple: config.allow_multiple,
             ticket_price: config.ticket_price,
@@ -482,13 +501,17 @@ impl Contract {
             return Err(Error::TicketsSoldOut);
         }
 
-        let current_count: u32 = env
-            .storage()
-            .persistent()
-            .get(&DataKey::TicketCount(buyer.clone()))
-            .unwrap_or(0);
+        let current_count = read_buyer_ticket_count(&env, &buyer);
         if !raffle.allow_multiple && (current_count > 0 || quantity > 1) {
             return Err(Error::MultipleTicketsNotAllowed);
+        }
+        if let Some(max_tickets_per_wallet) = raffle.max_tickets_per_wallet {
+            let updated_count = current_count
+                .checked_add(quantity)
+                .ok_or(Error::ArithmeticOverflow)?;
+            if updated_count > max_tickets_per_wallet {
+                return Err(Error::WalletTicketLimitExceeded);
+            }
         }
 
         let mut ticket_ids = Vec::new(&env);
@@ -542,10 +565,7 @@ impl Contract {
             .publish(&env);
         }
 
-        env.storage().persistent().set(
-            &DataKey::TicketCount(buyer.clone()),
-            &(current_count + quantity),
-        );
+        write_buyer_ticket_count(&env, &buyer, current_count + quantity);
         write_raffle(&env, &raffle);
 
         if let Some(factory_address) = env
@@ -1332,7 +1352,9 @@ mod test {
         let config = RaffleConfig {
             description: String::from_str(&env, "test raffle"),
             end_time: 0,                 // 0 => can finalize once tickets_full
+            no_deadline: true,
             max_tickets: 1,
+            max_tickets_per_wallet: None,
             min_tickets: 1,
             allow_multiple: true,
             ticket_price: MIN_TICKET_PRICE,
@@ -1365,5 +1387,108 @@ mod test {
         // Attacker authenticates fine (mock_all_auths) but is not the winner.
         let result = client.try_claim_prize(&attacker, &0u32);
         assert_eq!(result, Err(Ok(Error::NotWinner)));
+    }
+
+    fn wallet_limit_config(env: &Env, payment_token: &Address, limit: Option<u32>) -> RaffleConfig {
+        RaffleConfig {
+            description: String::from_str(&env, "wallet limit raffle"),
+            end_time: 0,
+            no_deadline: true,
+            max_tickets: 10,
+            max_tickets_per_wallet: limit,
+            min_tickets: 1,
+            allow_multiple: true,
+            ticket_price: MIN_TICKET_PRICE,
+            payment_token: payment_token.clone(),
+            prize_amount: MIN_TICKET_PRICE * 5,
+            prizes: vec![&env, 10000u32],
+            randomness_source: RandomnessSource::Internal,
+            oracle_address: None,
+            protocol_fee_bp: 0,
+            treasury_address: None,
+            swap_router: None,
+            tikka_token: None,
+            metadata_hash: BytesN::from_array(&env, &[2u8; 32]),
+            claim_lockup_seconds: 0,
+        }
+    }
+
+    #[test]
+    fn purchase_within_wallet_limit_succeeds() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let contract_id = env.register(Contract, ());
+        let client = ContractClient::new(&env, &contract_id);
+
+        let factory = env.register(MockFactory, ());
+        let admin = Address::generate(&env);
+        let creator = Address::generate(&env);
+        let buyer = Address::generate(&env);
+        let token_admin = Address::generate(&env);
+        let (token_addr, token_mint) = create_token(&env, &token_admin);
+        token_mint.mint(&creator, &1_000_000);
+        token_mint.mint(&buyer, &1_000_000);
+
+        let config = wallet_limit_config(&env, &token_addr, Some(2));
+        client.init(&factory, &admin, &creator, &config);
+        client.deposit_prize();
+        client.buy_tickets(&buyer, &1);
+        client.buy_tickets(&buyer, &1);
+
+        let count: u32 = env
+            .as_contract(&contract_id, || read_buyer_ticket_count(&env, &buyer));
+        assert_eq!(count, 2);
+    }
+
+    #[test]
+    fn purchase_above_wallet_limit_is_rejected() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let contract_id = env.register(Contract, ());
+        let client = ContractClient::new(&env, &contract_id);
+
+        let factory = env.register(MockFactory, ());
+        let admin = Address::generate(&env);
+        let creator = Address::generate(&env);
+        let buyer = Address::generate(&env);
+        let token_admin = Address::generate(&env);
+        let (token_addr, token_mint) = create_token(&env, &token_admin);
+        token_mint.mint(&creator, &1_000_000);
+        token_mint.mint(&buyer, &1_000_000);
+
+        let config = wallet_limit_config(&env, &token_addr, Some(2));
+        client.init(&factory, &admin, &creator, &config);
+        client.deposit_prize();
+        client.buy_tickets(&buyer, &2);
+
+        let result = client.try_buy_tickets(&buyer, &1);
+        assert_eq!(result, Err(Ok(Error::WalletTicketLimitExceeded)));
+    }
+
+    #[test]
+    fn wallet_limit_is_not_enforced_when_not_set() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let contract_id = env.register(Contract, ());
+        let client = ContractClient::new(&env, &contract_id);
+
+        let factory = env.register(MockFactory, ());
+        let admin = Address::generate(&env);
+        let creator = Address::generate(&env);
+        let buyer = Address::generate(&env);
+        let token_admin = Address::generate(&env);
+        let (token_addr, token_mint) = create_token(&env, &token_admin);
+        token_mint.mint(&creator, &1_000_000);
+        token_mint.mint(&buyer, &1_000_000);
+
+        let config = wallet_limit_config(&env, &token_addr, None);
+        client.init(&factory, &admin, &creator, &config);
+        client.deposit_prize();
+        client.buy_tickets(&buyer, &2);
+        client.buy_tickets(&buyer, &3);
+
+        let count: u32 = env
+            .as_contract(&contract_id, || read_buyer_ticket_count(&env, &buyer));
+        assert_eq!(count, 5);
     }
 }
