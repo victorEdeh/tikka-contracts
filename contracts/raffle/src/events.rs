@@ -79,6 +79,15 @@ pub struct AdminTransferAccepted {
 
 #[derive(Clone)]
 #[contractevent]
+pub struct AdminTransferFailed {
+    pub current_admin: Address,
+    pub proposed_admin: Address,
+    pub reason_code: u32,
+    pub timestamp: u64,
+}
+
+#[derive(Clone)]
+#[contractevent]
 pub struct CheckpointCreated {
     pub index: u32,
     pub raffle_count: u32,
