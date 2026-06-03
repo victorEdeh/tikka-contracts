@@ -1,7 +1,10 @@
 #![cfg(test)]
 
 use super::*;
-use soroban_sdk::{testutils::{Address as _, Ledger}, Address, Env, BytesN};
+use soroban_sdk::{
+    testutils::{Address as _, Ledger},
+    Address, BytesN, Env,
+};
 
 #[test]
 fn test_oracle_fallback_with_ledger_delays() {
@@ -67,7 +70,7 @@ fn test_oracle_fallback_with_ledger_delays() {
     // 9. Verify finalized state
     let raffle_after = client.get_raffle();
     assert_eq!(raffle_after.status, RaffleStatus::Finalized);
-    
+
     // We can also verify the fairness data
     let fairness = client.get_fairness_data();
     assert_eq!(fairness.randomness_source, RandomnessSource::External);
