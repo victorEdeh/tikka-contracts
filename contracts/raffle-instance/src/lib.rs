@@ -86,7 +86,6 @@ pub enum DataKey {
     TicketCount(Address),
     Ticket(u32),
     TicketRefunded(u32),
-    NextTicketId,
     Factory,
     ReentrancyGuard,
     Paused,
@@ -96,7 +95,6 @@ pub enum DataKey {
     RandomnessRequestLedger,
     RandomnessRequestId,
     FinishTime,
-    TotalTickets,
     AccumulatedFees,
 }
 
@@ -155,31 +153,11 @@ fn write_raffle(env: &Env, raffle: &Raffle) {
     env.storage().instance().set(&DataKey::Raffle, raffle);
 }
 
-fn get_ticket_count(env: &Env) -> u32 {
-    env.storage()
-        .persistent()
-        .get(&DataKey::NextTicketId)
-        .unwrap_or(0u32)
-}
-
 fn get_ticket_owner(env: &Env, ticket_id: u32) -> Option<Address> {
     env.storage()
         .persistent()
         .get::<_, Ticket>(&DataKey::Ticket(ticket_id))
         .map(|t| t.owner)
-}
-
-fn next_ticket_id(env: &Env) -> u32 {
-    let current: u32 = env
-        .storage()
-        .persistent()
-        .get(&DataKey::NextTicketId)
-        .unwrap_or(0u32);
-    let next = current + 1;
-    env.storage()
-        .persistent()
-        .set(&DataKey::NextTicketId, &next);
-    next
 }
 
 fn acquire_guard(env: &Env) -> Result<(), Error> {
@@ -529,20 +507,9 @@ impl Contract {
             / 10000;
         let _net_amount = total_price - protocol_fee;
 
-        // Read the counter once, assign IDs as a contiguous range, write counter once.
-        let first_ticket_id: u32 = env
-            .storage()
-            .instance()
-            .get(&DataKey::NextTicketId)
-            .unwrap_or(0u32);
-        let last_ticket_id = first_ticket_id + quantity; // IDs will be first+1 .. first+quantity
-        env.storage()
-            .instance()
-            .set(&DataKey::NextTicketId, &last_ticket_id);
-
-        for i in 0..quantity {
-            let ticket_id = first_ticket_id + i + 1;
+        for _ in 0..quantity {
             raffle.tickets_sold += 1;
+            let ticket_id = raffle.tickets_sold;
 
             let ticket = Ticket {
                 id: ticket_id,
@@ -1163,8 +1130,9 @@ impl Contract {
             .instance()
             .get(&DataKey::RandomnessSeed)
             .ok_or(Error::InvalidStatus)?;
+        let raffle = read_raffle(&env)?;
         let mut ticket_ids = Vec::new(&env);
-        let count = get_ticket_count(&env);
+        let count = raffle.tickets_sold;
         for i in 1..=count {
             ticket_ids.push_back(i);
         }
@@ -1307,7 +1275,7 @@ fn do_finalize_with_seed(
     seed: u64,
     randomness_type: RandomnessType,
 ) -> Result<(), Error> {
-    let total_tickets = get_ticket_count(env);
+    let total_tickets = raffle.tickets_sold;
     if total_tickets == 0 {
         return Err(Error::NoTicketsSold);
     }
