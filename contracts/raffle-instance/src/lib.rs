@@ -1210,6 +1210,7 @@ fn do_finalize_with_seed(
         .remove(&DataKey::RandomnessRequestLedger);
 
     RaffleFinalized {
+        raffle_id: env.current_contract_address(),
         winners,
         winning_ticket_ids,
         total_tickets_sold: raffle.tickets_sold,
