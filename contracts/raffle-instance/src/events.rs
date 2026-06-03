@@ -128,6 +128,15 @@ pub struct PrizeClaimed {
 
 #[derive(Clone)]
 #[contractevent]
+pub struct FeesWithdrawn {
+    pub recipient: Address,
+    pub amount: i128,
+    pub token: Address,
+    pub timestamp: u64,
+}
+
+#[derive(Clone)]
+#[contractevent]
 pub struct RandomnessFallbackTriggered {
     pub triggered_by: Address,
     pub seed_used: u64,

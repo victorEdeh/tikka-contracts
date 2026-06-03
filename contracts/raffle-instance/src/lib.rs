@@ -20,10 +20,10 @@ use raffle_shared::{
 use self::randomness::{OracleSeedWinnerSelection, WinnerSelectionStrategy};
 
 use crate::events::{
-    ContractPaused, ContractUnpaused, EmergencyWithdrawn, PrizeClaimed, PrizeDeposited,
-    PrizeRefunded, RaffleCancelled, RaffleCreated, RaffleFinalized, RaffleStatusChanged,
-    RandomnessFallbackTriggered, RandomnessReceived, RandomnessRequested, TicketPurchased,
-    TicketRefunded, WinnerDrawn,
+    ContractPaused, ContractUnpaused, EmergencyWithdrawn, FeesWithdrawn, PrizeClaimed,
+    PrizeDeposited, PrizeRefunded, RaffleCancelled, RaffleCreated, RaffleFinalized,
+    RaffleStatusChanged, RandomnessFallbackTriggered, RandomnessReceived, RandomnessRequested,
+    TicketPurchased, TicketRefunded, WinnerDrawn,
 };
 
 const ORACLE_TIMEOUT_LEDGERS: u32 = 200;
@@ -951,6 +951,36 @@ impl Contract {
         .publish(&env);
 
         Ok(net_amount)
+    }
+
+    pub fn withdraw_fees(
+        env: Env,
+        recipient: Address,
+        amount: i128,
+    ) -> Result<(), Error> {
+        let admin: Address = env.storage().instance().get(&DataKey::Admin).ok_or(Error::NotAuthorized)?;
+        admin.require_auth();
+
+        let raffle = read_raffle(&env)?;
+        if raffle.status != RaffleStatus::Finalized {
+            return Err(Error::InvalidStatus);
+        }
+
+        if amount <= 0 {
+            return Err(Error::InvalidParameters);
+        }
+
+        let token_client = token::Client::new(&env, &raffle.payment_token);
+        token_client.transfer(&env.current_contract_address(), &recipient, &amount);
+
+        FeesWithdrawn {
+            recipient,
+            amount,
+            token: raffle.payment_token.clone(),
+            timestamp: env.ledger().timestamp(),
+        }.publish(&env);
+
+        Ok(())
     }
 
     pub fn cancel_raffle(env: Env, reason: CancelReason) -> Result<(), Error> {
