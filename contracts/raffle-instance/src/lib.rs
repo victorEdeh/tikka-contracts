@@ -40,6 +40,7 @@ pub struct Raffle {
     pub creator: Address,
     pub description: String,
     pub end_time: u64,
+    pub no_deadline: bool,
     pub max_tickets: u32,
     pub min_tickets: u32,
     pub allow_multiple: bool,
@@ -296,7 +297,10 @@ impl Contract {
         }
 
         let now = env.ledger().timestamp();
-        if config.end_time <= now && config.end_time != 0 {
+        if config.no_deadline && config.end_time != 0 {
+            return Err(Error::InvalidParameters);
+        }
+        if !config.no_deadline && config.end_time <= now {
             return Err(Error::InvalidParameters);
         }
         if config.max_tickets == 0 || config.max_tickets > MAX_TICKETS_LIMIT {
@@ -361,6 +365,7 @@ impl Contract {
             creator: creator.clone(),
             description: config.description.clone(),
             end_time: config.end_time,
+            no_deadline: config.no_deadline,
             max_tickets: config.max_tickets,
             min_tickets: config.min_tickets,
             allow_multiple: config.allow_multiple,
@@ -468,7 +473,7 @@ impl Contract {
         if !raffle.prize_deposited {
             return Err(Error::InvalidStateTransition);
         }
-        if raffle.end_time != 0 && env.ledger().timestamp() > raffle.end_time {
+        if !raffle.no_deadline && env.ledger().timestamp() > raffle.end_time {
             return Err(Error::RaffleExpired);
         }
 
@@ -609,7 +614,7 @@ impl Contract {
         }
 
         let now = env.ledger().timestamp();
-        let time_ended = raffle.end_time != 0 && now >= raffle.end_time;
+        let time_ended = !raffle.no_deadline && now >= raffle.end_time;
         let tickets_full = raffle.tickets_sold >= raffle.max_tickets;
 
         if raffle.status == RaffleStatus::Active && !time_ended && !tickets_full {
