@@ -645,6 +645,67 @@ impl Contract {
         Ok(raffle.tickets_sold)
     }
 
+    pub fn transfer_ticket(env: Env, ticket_id: u32, new_owner: Address) -> Result<(), Error> {
+        let mut raffle = read_raffle(&env)?;
+        let mut ticket: Ticket = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Ticket(ticket_id))
+            .ok_or(Error::TicketNotFound)?;
+
+        ticket.owner.require_auth();
+
+        if raffle.status != RaffleStatus::Active {
+            return Err(Error::InvalidStateTransition);
+        }
+
+        if raffle.end_time != 0 && env.ledger().timestamp() > raffle.end_time {
+            return Err(Error::RaffleExpired);
+        }
+
+        if ticket.owner == new_owner {
+            return Ok(());
+        }
+
+        let current_owner = ticket.owner.clone();
+        let old_count: u32 = env
+            .storage()
+            .persistent()
+            .get(&DataKey::TicketCount(current_owner.clone()))
+            .unwrap_or(0);
+
+        let new_owner_count: u32 = env
+            .storage()
+            .persistent()
+            .get(&DataKey::TicketCount(new_owner.clone()))
+            .unwrap_or(0);
+
+        if !raffle.allow_multiple && new_owner_count > 0 {
+            return Err(Error::MultipleTicketsNotAllowed);
+        }
+
+        let updated_old_count = old_count.checked_sub(1).ok_or(Error::InvalidStateTransition)?;
+        env.storage()
+            .persistent()
+            .set(&DataKey::TicketCount(current_owner.clone()), &updated_old_count);
+        env.storage()
+            .persistent()
+            .set(&DataKey::TicketCount(new_owner.clone()), &(new_owner_count + 1));
+
+        ticket.owner = new_owner.clone();
+        env.storage().persistent().set(&DataKey::Ticket(ticket_id), &ticket);
+
+        TicketTransferred {
+            ticket_id,
+            from: current_owner,
+            to: new_owner,
+            timestamp: env.ledger().timestamp(),
+        }
+        .publish(&env);
+
+        Ok(())
+    }
+
     pub fn finalize_raffle(env: Env) -> Result<(), Error> {
         bump_instance_ttl(&env);
         let mut raffle = read_raffle(&env)?;
