@@ -863,6 +863,7 @@ impl Contract {
 
     pub fn provide_randomness(
         env: Env,
+        request_id: u64,
         random_seed: u64,
         public_key: BytesN<32>,
         proof: BytesN<64>,
