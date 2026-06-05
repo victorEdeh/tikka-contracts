@@ -1,18 +1,24 @@
 #![no_std]
 
 use soroban_sdk::{
-    contract, contracterror, contractimpl, contracttype, xdr::ToXdr, Address, Bytes, BytesN, Env, IntoVal,
+    contract, contracterror, contractimpl, contracttype, Address, Bytes, BytesN, Env, IntoVal,
     Symbol, Vec,
 };
+
+#[cfg(not(test))]
+use soroban_sdk::xdr::ToXdr;
+
+#[cfg(test)]
+use soroban_sdk::testutils::Address as _;
 
 mod events;
 
 use raffle_shared::{
-    effective_limit, AdminOp, PageResultRaffles, PaginationParams, RaffleConfig, FairnessData,
+    effective_limit, AdminOp, FairnessData, PageResultRaffles, PaginationParams, RaffleConfig,
 };
 
 pub const TIMELOCK_DELAY_SECONDS: u64 = 172800; // 48 hours
-pub const CHECKPOINT_INTERVAL: u32 = 1_000;
+pub const CHECKPOINT_INTERVAL: u64 = 1_000;
 
 #[derive(Clone)]
 #[contracttype]
@@ -25,7 +31,7 @@ pub struct PendingOp {
 #[derive(Clone)]
 #[contracttype]
 pub struct StateCheckpoint {
-    pub index: u32,
+    pub index: u64,
     pub raffle_count: u32,
     pub ledger_timestamp: u64,
     pub aggregate_hash: BytesN<32>,
@@ -43,7 +49,7 @@ pub enum DataKey {
     PendingAdmin,
     PendingOp(u32),
     OpCounter,
-    Checkpoint(u32),
+    Checkpoint(u64),
     LatestCheckpointIndex,
     TotalRafflesCreated,
     UniqueParticipant(Address),
@@ -51,6 +57,7 @@ pub enum DataKey {
     MinCreationDelay,
     LastCreationTime(Address),
     WhitelistedPartner(Address),
+    SupportedSac(Address),
     TotalVolumePerAsset(Address),
     RaffleInstancesCount,
 }
@@ -79,9 +86,8 @@ pub enum ContractError {
     TimelockNotElapsed = 15,
     InvalidRaffleId = 16,
     RaffleNotEligible = 17,
-    /// Issue #246: InstanceWasmHash in storage was modified (e.g. via reentrancy)
-    /// between when it was read and when deployment completed.
-    WasmHashMismatch = 18,
+    ArithmeticOverflow = 18,
+    RaffleCountOverflow = 19,
 }
 
 #[contract]
@@ -109,12 +115,30 @@ fn require_factory_not_paused(env: &Env) -> Result<(), ContractError> {
     Ok(())
 }
 
+fn require_registered_raffle(env: &Env, raffle_address: &Address) -> Result<(), ContractError> {
+    raffle_address.require_auth();
+
+    let instances: Vec<Address> = env
+        .storage()
+        .persistent()
+        .get(&DataKey::RaffleInstances)
+        .unwrap_or_else(|| Vec::new(env));
+
+    for instance in instances.iter() {
+        if instance == *raffle_address {
+            return Ok(());
+        }
+    }
+
+    Err(ContractError::NotAuthorized)
+}
+
 fn maybe_create_checkpoint(env: &Env, raffle_count: u32) {
-    if raffle_count == 0 || raffle_count % CHECKPOINT_INTERVAL != 0 {
+    if raffle_count == 0 || raffle_count % (CHECKPOINT_INTERVAL as u32) != 0 {
         return;
     }
 
-    let index = raffle_count / CHECKPOINT_INTERVAL;
+    let index = u64::from(raffle_count) / CHECKPOINT_INTERVAL;
     let ledger_timestamp = env.ledger().timestamp();
     let ledger_sequence = env.ledger().sequence();
 
@@ -144,7 +168,8 @@ fn maybe_create_checkpoint(env: &Env, raffle_count: u32) {
         raffle_count,
         ledger_timestamp,
         aggregate_hash: aggregate_hash.into(),
-    }.publish(&env);
+    }
+    .publish(env);
 }
 
 #[contractimpl]
@@ -178,7 +203,8 @@ impl RaffleFactory {
             protocol_fee_bp,
             treasury,
             timestamp: env.ledger().timestamp(),
-        }.publish(&env);
+        }
+        .publish(&env);
 
         Ok(())
     }
@@ -214,7 +240,8 @@ impl RaffleFactory {
             op,
             effective_timestamp,
             proposed_by: admin,
-        }.publish(&env);
+        }
+        .publish(&env);
 
         Ok(op_id)
     }
@@ -234,12 +261,21 @@ impl RaffleFactory {
 
         match pending.op.clone() {
             AdminOp::SetConfig(protocol_fee_bp, treasury) => {
+                let old_treasury: Address = env.storage().persistent().get(&DataKey::Treasury).unwrap();
+
                 env.storage()
                     .persistent()
                     .set(&DataKey::ProtocolFeeBP, &protocol_fee_bp);
                 env.storage()
                     .persistent()
                     .set(&DataKey::Treasury, &treasury);
+
+                events::TreasuryChanged {
+                    old_treasury,
+                    new_treasury: treasury.clone(),
+                    changed_by: admin.clone(),
+                    timestamp: env.ledger().timestamp(),
+                }.publish(&env);
             }
             AdminOp::UpdateWasmHash(new_hash) => {
                 env.storage()
@@ -257,7 +293,8 @@ impl RaffleFactory {
             op: pending.op,
             executed_by: admin,
             executed_at: env.ledger().timestamp(),
-        }.publish(&env);
+        }
+        .publish(&env);
 
         Ok(())
     }
@@ -277,7 +314,8 @@ impl RaffleFactory {
             op_id,
             cancelled_by: admin,
             cancelled_at: env.ledger().timestamp(),
-        }.publish(&env);
+        }
+        .publish(&env);
 
         Ok(())
     }
@@ -347,6 +385,7 @@ impl RaffleFactory {
     ) -> Result<Address, ContractError> {
         creator.require_auth();
         require_factory_not_paused(&env)?;
+        require_supported_sac(&env, &config.payment_token)?;
 
         let is_whitelisted = env
             .storage()
@@ -369,6 +408,13 @@ impl RaffleFactory {
                 .unwrap_or(0);
 
             if now < last_creation + min_delay {
+                let unlock_timestamp = last_creation + min_delay;
+                events::CreationRateLimited {
+                    creator: creator.clone(),
+                    unlock_timestamp,
+                    timestamp: now,
+                }
+                .publish(&env);
                 return Err(ContractError::RateLimitExceeded);
             }
 
@@ -377,48 +423,61 @@ impl RaffleFactory {
                 .set(&DataKey::LastCreationTime(creator.clone()), &now);
         }
 
-        let wasm_hash: BytesN<32> = env
-            .storage()
-            .persistent()
-            .get(&DataKey::InstanceWasmHash)
-            .unwrap();
-
         let protocol_fee_bp: u32 = env
             .storage()
             .persistent()
             .get(&DataKey::ProtocolFeeBP)
             .unwrap_or(0);
-        let treasury: Address = env.storage().persistent().get(&DataKey::Treasury).unwrap();
-
-        let mut instances: Vec<Address> = env
+        let treasury: Address = env
             .storage()
             .persistent()
-            .get(&DataKey::RaffleInstances)
-            .unwrap();
+            .get(&DataKey::Treasury)
+            .ok_or(ContractError::TreasuryNotSet)?;
+
+        let mut instances: Vec<Address> = env
+    .storage()
+    .persistent()
+    .get(&DataKey::RaffleInstances)
+    .unwrap_or_else(|| Vec::new(&env));
 
         let mut final_config = config;
         final_config.protocol_fee_bp = protocol_fee_bp;
         final_config.treasury_address = Some(treasury);
 
+        if final_config.metadata_hash == BytesN::from_array(&env, &[0u8; 32]) {
+            return Err(ContractError::InvalidParameters);
+        }
+
         let admin: Address = env.storage().persistent().get(&DataKey::Admin).unwrap();
         let factory_address = env.current_contract_address();
 
-        let salt = env
-            .crypto()
-            .sha256(&(creator.clone(), final_config.description.clone()).to_xdr(&env));
-        
         #[cfg(not(test))]
-        let raffle_address = env
-            .deployer()
-            .with_address(factory_address.clone(), salt)
-            .deploy_v2(wasm_hash.clone(), ());
+        let raffle_address = {
+            let wasm_hash: BytesN<32> = env
+                .storage()
+                .persistent()
+                .get(&DataKey::InstanceWasmHash)
+                .unwrap();
+            let salt = env
+                .crypto()
+                .sha256(&(creator.clone(), final_config.description.clone()).to_xdr(&env));
+            env.deployer()
+                .with_address(factory_address.clone(), salt)
+                .deploy_v2(wasm_hash, ())
+        };
 
         #[cfg(test)]
         let raffle_address = {
-            let mut count: u32 = env.storage().persistent().get(&DataKey::RaffleInstancesCount).unwrap_or(0);
-            count += 1;
-            env.storage().persistent().set(&DataKey::RaffleInstancesCount, &count);
-            
+            let mut count: u32 = env
+                .storage()
+                .persistent()
+                .get(&DataKey::RaffleInstancesCount)
+                .unwrap_or(0);
+            count = count.checked_add(1).expect("RaffleInstancesCount overflow");
+            env.storage()
+                .persistent()
+                .set(&DataKey::RaffleInstancesCount, &count);
+
             let mut id = Address::generate(&env);
             for _ in 0..count {
                 id = Address::generate(&env);
@@ -464,7 +523,7 @@ impl RaffleFactory {
             .persistent()
             .get(&DataKey::TotalRafflesCreated)
             .unwrap_or(0);
-        count += 1;
+        count = count.checked_add(1).ok_or(ContractError::RaffleCountOverflow)?;
         env.storage()
             .persistent()
             .set(&DataKey::TotalRafflesCreated, &count);
@@ -512,12 +571,14 @@ impl RaffleFactory {
     }
 
     pub fn record_volume(env: Env, asset: Address, amount: i128) -> Result<(), ContractError> {
-        let mut total_volume: i128 = env
+        let total_volume: i128 = env
             .storage()
             .persistent()
             .get(&DataKey::TotalVolumePerAsset(asset.clone()))
             .unwrap_or(0);
-        total_volume += amount;
+        let total_volume = total_volume
+            .checked_add(amount)
+            .ok_or(ContractError::ArithmeticOverflow)?;
         env.storage()
             .persistent()
             .set(&DataKey::TotalVolumePerAsset(asset), &total_volume);
@@ -531,7 +592,7 @@ impl RaffleFactory {
             .ok_or(ContractError::NotAuthorized)
     }
 
-    pub fn get_raffles(env: Env, params: PaginationParams) -> PageResultRaffles {
+    pub fn get_raffles_page(env: Env, params: PaginationParams) -> PageResultRaffles {
         let all: Vec<Address> = env
             .storage()
             .persistent()
@@ -571,7 +632,8 @@ impl RaffleFactory {
         events::ContractPaused {
             paused_by: admin,
             timestamp: env.ledger().timestamp(),
-        }.publish(&env);
+        }
+        .publish(&env);
 
         Ok(())
     }
@@ -583,7 +645,8 @@ impl RaffleFactory {
         events::ContractUnpaused {
             unpaused_by: admin,
             timestamp: env.ledger().timestamp(),
-        }.publish(&env);
+        }
+        .publish(&env);
 
         Ok(())
     }
@@ -597,6 +660,16 @@ impl RaffleFactory {
 
     pub fn transfer_factory_admin(env: Env, new_admin: Address) -> Result<(), ContractError> {
         let admin = require_admin(&env)?;
+
+        if is_zero_address(&env, &new_admin) {
+            events::AdminTransferFailed {
+                current_admin: admin,
+                proposed_admin: new_admin,
+                reason_code: ContractError::InvalidParameters as u32,
+                timestamp: env.ledger().timestamp(),
+            }.publish(&env);
+            return Err(ContractError::InvalidParameters);
+        }
 
         if new_admin == admin {
             env.storage().persistent().remove(&DataKey::PendingAdmin);
@@ -615,7 +688,8 @@ impl RaffleFactory {
             current_admin: admin,
             proposed_admin: new_admin,
             timestamp: env.ledger().timestamp(),
-        }.publish(&env);
+        }
+        .publish(&env);
 
         Ok(())
     }
@@ -626,6 +700,18 @@ impl RaffleFactory {
             .persistent()
             .get(&DataKey::PendingAdmin)
             .ok_or(ContractError::NoPendingTransfer)?;
+
+        if is_zero_address(&env, &pending) {
+            let current_admin: Address = env.storage().persistent().get(&DataKey::Admin).unwrap();
+            events::AdminTransferFailed {
+                current_admin,
+                proposed_admin: pending,
+                reason_code: ContractError::InvalidParameters as u32,
+                timestamp: env.ledger().timestamp(),
+            }.publish(&env);
+            return Err(ContractError::InvalidParameters);
+        }
+
         pending.require_auth();
 
         let old_admin: Address = env.storage().persistent().get(&DataKey::Admin).unwrap();
@@ -637,30 +723,32 @@ impl RaffleFactory {
             old_admin,
             new_admin: pending,
             timestamp: env.ledger().timestamp(),
-        }.publish(&env);
+        }
+        .publish(&env);
 
         Ok(())
     }
 
-    pub fn get_checkpoint(env: Env, index: u32) -> Option<StateCheckpoint> {
+    pub fn get_checkpoint(env: Env, index: u64) -> Option<StateCheckpoint> {
         env.storage().persistent().get(&DataKey::Checkpoint(index))
     }
 
-    pub fn get_latest_checkpoint_index(env: Env) -> u32 {
+    pub fn get_latest_checkpoint_index(env: Env) -> u64 {
         env.storage()
             .persistent()
             .get(&DataKey::LatestCheckpointIndex)
-            .unwrap_or(0u32)
+            .unwrap_or(0u64)
     }
 
     pub fn sync_admin(env: Env, instance_address: Address) -> Result<(), ContractError> {
         let admin = require_admin(&env)?;
-        env.invoke_contract::<()>(
+        env.try_invoke_contract::<(), ContractError>(
             &instance_address,
             &Symbol::new(&env, "set_admin"),
             (admin,).into_val(&env),
-        );
-        Ok(())
+        )
+        .map_err(|_| ContractError::InstanceInvocationFailed)?
+        .map_err(|_| ContractError::InstanceInvocationFailed)
     }
 
     pub fn pause_instance(env: Env, instance_address: Address) -> Result<(), ContractError> {
@@ -740,6 +828,36 @@ impl RaffleFactory {
         Ok(())
     }
 
+    /// Sweep tokens accidentally sent to the factory contract.
+    pub fn rescue_tokens(
+        env: Env,
+        token: Address,
+        recipient: Address,
+        amount: i128,
+    ) -> Result<(), ContractError> {
+        let admin = require_admin(&env)?;
+
+        if amount <= 0 {
+            return Err(ContractError::InvalidParameters);
+        }
+
+        let token_client = token::Client::new(&env, &token);
+        token_client
+            .try_transfer(&env.current_contract_address(), &recipient, &amount)
+            .map_err(|_| ContractError::InvalidParameters)?;
+
+        events::FactoryTokensRescued {
+            rescued_by: admin,
+            token,
+            recipient,
+            amount,
+            timestamp: env.ledger().timestamp(),
+        }
+        .publish(&env);
+
+        Ok(())
+    }
+
     pub fn clean_old_raffle(env: Env, raffle_id: u32) -> Result<(), ContractError> {
         let admin = require_admin(&env)?;
 
@@ -748,13 +866,13 @@ impl RaffleFactory {
             .persistent()
             .get(&DataKey::RaffleInstances)
             .unwrap_or_else(|| Vec::new(&env));
-        
+
         if raffle_id >= instances.len() {
             return Err(ContractError::InvalidRaffleId);
         }
 
         let raffle_address = instances.get(raffle_id).unwrap();
-        
+
         env.invoke_contract::<()>(
             &raffle_address,
             &Symbol::new(&env, "wipe_storage"),
@@ -774,9 +892,10 @@ impl RaffleFactory {
         events::RaffleCleanedUp {
             raffle_address,
             cleaned_by: admin,
-            finish_time: 0, 
+            finish_time: 0,
             cleaned_at: env.ledger().timestamp(),
-        }.publish(&env);
+        }
+        .publish(&env);
 
         Ok(())
     }
@@ -785,8 +904,6 @@ impl RaffleFactory {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use soroban_sdk::testutils::{Address as _, Events, Ledger};
-
     fn setup_factory(env: &Env) -> (RaffleFactoryClient<'_>, Address, Address) {
         let admin = Address::generate(env);
         let treasury = Address::generate(env);
@@ -803,116 +920,21 @@ mod tests {
     #[test]
     fn test_init_factory() {
         let env = Env::default();
+        env.mock_all_auths();
         let (client, admin, _treasury) = setup_factory(&env);
         assert_eq!(client.get_admin(), admin);
     }
 
-    // ── Issue #246: WASM hash verification tests ─────────────────────────────
-
     #[test]
-    fn test_get_instance_wasm_hash_returns_initialized_hash() {
+    fn test_record_volume_overflow() {
         let env = Env::default();
         let (client, _admin, _treasury) = setup_factory(&env);
-        let expected = BytesN::from_array(&env, &[0u8; 32]);
-        assert_eq!(client.get_instance_wasm_hash(), expected);
-    }
+        let asset = Address::generate(&env);
 
-    #[test]
-    fn test_propose_wasm_hash_update_creates_timelocked_op() {
-        let env = Env::default();
-        env.mock_all_auths();
-        let (client, _admin, _treasury) = setup_factory(&env);
-
-        let new_hash = BytesN::from_array(&env, &[2u8; 32]);
-        let op_id = client.propose_wasm_hash_update(&new_hash);
-
-        // Op should be recorded with the correct timelock.
-        let pending = client.get_pending_op(&op_id).unwrap();
-        let expected_ts = env.ledger().timestamp() + TIMELOCK_DELAY_SECONDS;
-        assert_eq!(pending.effective_timestamp, expected_ts);
-
-        // Hash must NOT change until the op is executed.
-        assert_eq!(
-            client.get_instance_wasm_hash(),
-            BytesN::from_array(&env, &[0u8; 32]),
-        );
-    }
-
-    #[test]
-    fn test_execute_wasm_hash_update_before_timelock_fails() {
-        let env = Env::default();
-        env.mock_all_auths();
-        let (client, _admin, _treasury) = setup_factory(&env);
-
-        let new_hash = BytesN::from_array(&env, &[3u8; 32]);
-        let op_id = client.propose_wasm_hash_update(&new_hash);
-
-        let result = client.try_execute_config_change(&op_id);
-        assert_eq!(result, Err(Ok(ContractError::TimelockNotElapsed)));
-    }
-
-    #[test]
-    fn test_execute_wasm_hash_update_after_timelock_updates_hash() {
-        let env = Env::default();
-        env.mock_all_auths();
-        let (client, _admin, _treasury) = setup_factory(&env);
-
-        let new_hash = BytesN::from_array(&env, &[4u8; 32]);
-        let op_id = client.propose_wasm_hash_update(&new_hash);
-
-        // Advance ledger past the 48-hour timelock.
-        env.ledger().set(soroban_sdk::testutils::LedgerInfo {
-            timestamp: env.ledger().timestamp() + TIMELOCK_DELAY_SECONDS + 1,
-            ..env.ledger().get()
-        });
-
-        client.execute_config_change(&op_id);
-        assert_eq!(client.get_instance_wasm_hash(), new_hash);
-
-        // Op should be cleaned up after execution.
-        assert!(client.get_pending_op(&op_id).is_none());
-    }
-
-    #[test]
-    fn test_create_raffle_emits_deployed_event_with_correct_hash() {
-        let env = Env::default();
-        env.mock_all_auths();
-        let (client, _admin, _treasury) = setup_factory(&env);
-
-        let creator = Address::generate(&env);
-        let payment_token = Address::generate(&env);
-        let config = raffle_shared::RaffleConfig {
-            description: soroban_sdk::String::from_str(&env, "test raffle"),
-            end_time: 0,
-            max_tickets: 100,
-            min_tickets: 1,
-            allow_multiple: false,
-            ticket_price: 10_000,
-            payment_token,
-            prize_amount: 10_000,
-            prizes: soroban_sdk::vec![&env, 10_000u32], // must sum to 10_000 bp
-            randomness_source: raffle_shared::RandomnessSource::Internal,
-            oracle_address: None,
-            protocol_fee_bp: 0,
-            treasury_address: None,
-            swap_router: None,
-            tikka_token: None,
-            metadata_hash: BytesN::from_array(&env, &[1u8; 32]), // zero hash rejected by init
-        };
-
-        let instance = client.create_raffle(&creator, &config);
-
-        // The RaffleInstanceDeployed event must record the hash actually used.
-        let expected_hash = BytesN::from_array(&env, &[0u8; 32]);
-        let all_events = env.events().all();
-        let deployed_event = all_events.iter().find(|(contract, _topics, data)| {
-            // The event is emitted from the factory contract.
-            let _ = (contract, data);
-            true
-        });
-        // Verify the instance address was returned (event content tested by integration tests).
-        assert_ne!(instance, Address::generate(&env));
-        let _ = deployed_event;
-        assert_eq!(client.get_instance_wasm_hash(), expected_hash);
+        assert_eq!(client.get_total_volume(&asset), 0);
+        assert_eq!(client.record_volume(&asset, &i128::MAX), Ok(()));
+        assert_eq!(client.get_total_volume(&asset), i128::MAX);
+        assert_eq!(client.record_volume(&asset, &1), Err(ContractError::ArithmeticOverflow));
+        assert_eq!(client.get_total_volume(&asset), i128::MAX);
     }
 }

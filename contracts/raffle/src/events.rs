@@ -1,5 +1,7 @@
-use soroban_sdk::{contractevent, Address, BytesN, u128};
+use soroban_sdk::{contractevent, Address, BytesN};
 use raffle_shared::AdminOp;
+use soroban_sdk::{contractevent, Address, BytesN};
+
 
 /// Emitted after every successful raffle instance deployment.
 /// Records the exact WASM hash used so any deviation from InstanceWasmHash
@@ -43,6 +45,16 @@ pub struct AdminOpExecuted {
 
 #[derive(Clone)]
 #[contractevent]
+pub struct TreasuryChanged {
+    pub old_treasury: Address,
+    pub new_treasury: Address,
+    #[topic]
+    pub changed_by: Address,
+    pub timestamp: u64,
+}
+
+#[derive(Clone)]
+#[contractevent]
 pub struct AdminOpCancelled {
     pub op_id: u32,
     pub cancelled_by: Address,
@@ -81,6 +93,15 @@ pub struct AdminTransferAccepted {
 
 #[derive(Clone)]
 #[contractevent]
+pub struct AdminTransferFailed {
+    pub current_admin: Address,
+    pub proposed_admin: Address,
+    pub reason_code: u32,
+    pub timestamp: u64,
+}
+
+#[derive(Clone)]
+#[contractevent]
 pub struct CheckpointCreated {
     pub index: u32,
     pub raffle_count: u32,
@@ -90,9 +111,31 @@ pub struct CheckpointCreated {
 
 #[derive(Clone)]
 #[contractevent]
+pub struct SupportedSacUpdated {
+    pub token: Address,
+    pub supported: bool,
+    pub updated_by: Address,
+    pub timestamp: u64,
+}
+
+#[derive(Clone)]
+#[contractevent]
 pub struct RaffleCleanedUp {
     pub raffle_address: Address,
     pub cleaned_by: Address,
     pub finish_time: u64,
     pub cleaned_at: u64,
+}
+
+#[derive(Clone)]
+#[contractevent]
+pub struct TicketPurchased {
+    pub raffle_id: Address,
+    pub purchaser: Address,
+    pub ticket_id: u32,
+    pub amount: i128,
+pub struct CreationRateLimited {
+    pub creator: Address,
+    pub unlock_timestamp: u64,
+    pub timestamp: u64,
 }
